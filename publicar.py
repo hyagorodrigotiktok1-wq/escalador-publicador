@@ -86,9 +86,11 @@ def download_video(asset):
     return out
 
 
-def publish_reel(token, video, caption):
+def publish_reel(token, ig_user, video, caption):
     host = graph_host(token)
-    resp = requests.post(f"{host}/{API_VERSION}/me/media", data={
+    # Tokens do Instagram Login aceitam "me"; os de Página do Facebook precisam do ID da conta do Instagram
+    ig = "me" if host.endswith("instagram.com") else ig_user
+    resp = requests.post(f"{host}/{API_VERSION}/{ig}/media", data={
         "media_type": "REELS", "upload_type": "resumable", "caption": caption,
         "share_to_feed": "true", "access_token": token}, timeout=60)
     if not resp.ok:
@@ -116,7 +118,7 @@ def publish_reel(token, video, caption):
     else:
         raise RuntimeError("Instagram demorou demais para processar o vídeo")
 
-    resp = requests.post(f"{host}/{API_VERSION}/me/media_publish",
+    resp = requests.post(f"{host}/{API_VERSION}/{ig}/media_publish",
                          data={"creation_id": container, "access_token": token}, timeout=60)
     if not resp.ok:
         raise RuntimeError(f"Publicar: {api_error(resp)}")
@@ -182,7 +184,7 @@ def main():
             token = fernet.decrypt(acc["token"].encode()).decode()
             video = download_video(post["asset"])
             caption = f"{post['caption']}\n\n{post.get('hashtags', '')}".strip()
-            upd.update(media_id=publish_reel(token, video, caption), status="posted",
+            upd.update(media_id=publish_reel(token, acc.get("user_id"), video, caption), status="posted",
                        posted_at=now().isoformat(), error=None)
             print(f"[ok] {post['id']} publicado em @{acc.get('username')}")
             video.unlink(missing_ok=True)
