@@ -104,25 +104,67 @@ def publish_reel(token, ig_user, video, caption):
     if not resp.ok:
         raise RuntimeError(f"Enviar vídeo: {api_error(resp)}")
 
-    for _ in range(60):  # até 10 min processando
-        time.sleep(10)
+    wait_container(host, token, container)
+    return publish_container(host, token, ig, container)
+
+
+def wait_container(host, token, container, tries=60, every=10):
+    """Espera o Instagram terminar de processar a mídia (até ~10 min)."""
+    for _ in range(tries):
+        time.sleep(every)
         st = requests.get(f"{host}/{API_VERSION}/{container}",
                           params={"fields": "status_code,status", "access_token": token}, timeout=30)
         if not st.ok:
             raise RuntimeError(f"Status: {api_error(st)}")
         code = st.json().get("status_code")
-        if code == "FINISHED":
-            break
+        if code in (None, "FINISHED"):  # imagens às vezes nem informam status: já estão prontas
+            return
         if code in ("ERROR", "EXPIRED"):
-            raise RuntimeError(f"Instagram recusou o vídeo: {st.json().get('status')}")
-    else:
-        raise RuntimeError("Instagram demorou demais para processar o vídeo")
+            raise RuntimeError(f"Instagram recusou a mídia: {st.json().get('status')}")
+    raise RuntimeError("Instagram demorou demais para processar a mídia")
 
+
+def publish_container(host, token, ig, container):
     resp = requests.post(f"{host}/{API_VERSION}/{ig}/media_publish",
                          data={"creation_id": container, "access_token": token}, timeout=60)
     if not resp.ok:
         raise RuntimeError(f"Publicar: {api_error(resp)}")
     return resp.json()["id"]
+
+
+def image_url(path):
+    """Link direto da foto no repositório (público): o Instagram baixa a imagem daqui."""
+    return f"https://raw.githubusercontent.com/{os.environ.get('GITHUB_REPOSITORY', '')}/main/{path}"
+
+
+def _create(host, token, ig, data):
+    resp = requests.post(f"{host}/{API_VERSION}/{ig}/media", data={**data, "access_token": token}, timeout=60)
+    if not resp.ok:
+        raise RuntimeError(f"Criar container: {api_error(resp)}")
+    return resp.json()["id"]
+
+
+def _ig(token, ig_user):
+    host = graph_host(token)
+    # Tokens do Instagram Login aceitam "me"; os de Página do Facebook precisam do ID da conta do Instagram
+    return host, ("me" if host.endswith("instagram.com") else ig_user)
+
+
+def publish_photo(token, ig_user, path, caption):
+    host, ig = _ig(token, ig_user)
+    container = _create(host, token, ig, {"image_url": image_url(path), "caption": caption})
+    wait_container(host, token, container, tries=12, every=5)
+    return publish_container(host, token, ig, container)
+
+
+def publish_carousel(token, ig_user, paths, caption):
+    host, ig = _ig(token, ig_user)
+    children = [_create(host, token, ig, {"image_url": image_url(p), "is_carousel_item": "true"}) for p in paths]
+    for child in children:
+        wait_container(host, token, child, tries=12, every=5)
+    container = _create(host, token, ig, {"media_type": "CAROUSEL", "children": ",".join(children), "caption": caption})
+    wait_container(host, token, container, tries=24, every=5)
+    return publish_container(host, token, ig, container)
 
 
 # ---------- persistência ----------
@@ -131,7 +173,7 @@ def git(*args):
     return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
 
 
-def persist(post_updates, accounts_changed, accounts):
+def persist(post_updates, accounts_changed, accounts, remove_files=()):
     """Grava e faz push. Se o site mexeu na fila ao mesmo tempo, recomeça do estado remoto
     e reaplica só os campos que o robô alterou (nada de conflito de merge)."""
     for attempt in range(5):
@@ -140,6 +182,10 @@ def persist(post_updates, accounts_changed, accounts):
             if p["id"] in post_updates:
                 p.update(post_updates[p["id"]])
         save(QUEUE, queue)
+        for f in remove_files:  # fotos já publicadas saem do repositório
+            (ROOT / f).unlink(missing_ok=True)
+        if remove_files:
+            git("add", "-A", *remove_files)
         if accounts_changed:
             remote = load(ACCOUNTS, {})
             for name, acc in accounts.items():
@@ -182,20 +228,27 @@ def main():
         upd = {"attempts": post.get("attempts", 0) + 1}
         try:
             token = fernet.decrypt(acc["token"].encode()).decode()
-            video = download_video(post["asset"])
+            kind = post.get("type", "reel")
             caption = f"{post['caption']}\n\n{post.get('hashtags', '')}".strip()
-            upd.update(media_id=publish_reel(token, acc.get("user_id"), video, caption), status="posted",
-                       posted_at=now().isoformat(), error=None)
-            print(f"[ok] {post['id']} publicado em @{acc.get('username')}")
-            video.unlink(missing_ok=True)
+            if kind == "photo":
+                media_id = publish_photo(token, acc.get("user_id"), post["images"][0], caption)
+            elif kind == "carousel":
+                media_id = publish_carousel(token, acc.get("user_id"), post["images"], caption)
+            else:
+                video = download_video(post["asset"])
+                media_id = publish_reel(token, acc.get("user_id"), video, caption)
+                video.unlink(missing_ok=True)
+            upd.update(media_id=media_id, status="posted", posted_at=now().isoformat(), error=None)
+            print(f"[ok] {post['id']} ({kind}) publicado em @{acc.get('username')}")
         except Exception as e:
             upd["error"] = str(e)[:500]
             if upd["attempts"] >= MAX_ATTEMPTS:
                 upd["status"] = "error"
             print(f"[erro] {post['id']}: {e}")
         # Salva logo depois de cada post: se o job cair, não publica duas vezes
-        persist({post["id"]: upd}, False, accounts)
-        if upd.get("status") == "posted":
+        done = upd.get("status") == "posted"
+        persist({post["id"]: upd}, False, accounts, (post.get("images") or ()) if done else ())
+        if done and post.get("asset"):
             subprocess.run(["gh", "release", "delete-asset", "videos", post["asset"], "-y"], cwd=ROOT)
     return 0
 
