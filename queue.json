@@ -7,9 +7,9 @@
     "hashtags": "#teste",
     "scheduled_at": "2026-10-27T15:18:20Z",
     "status": "pending",
-    "attempts": 0,
+    "attempts": 1,
     "posted_at": null,
     "media_id": null,
-    "error": null
+    "error": "Criar container: [400] Failed to decrypt"
   }
 ]
