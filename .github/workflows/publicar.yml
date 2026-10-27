@@ -1,0 +1,31 @@
+name: Publicar no Instagram
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -q requests cryptography
+
+      - run: python publicar.py
+        env:
+          ESCALADOR_KEY: ${{ secrets.ESCALADOR_KEY }}
+          GH_TOKEN: ${{ github.token }}
