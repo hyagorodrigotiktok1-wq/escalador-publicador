@@ -24,6 +24,9 @@ API_VERSION = "v22.0"
 MAX_ATTEMPTS = 3
 REFRESH_EVERY = timedelta(days=7)
 MAX_PER_RUN = 5
+# O cron do GitHub atrasa (às vezes mais de 1h). Por isso cada execução fica esperando os posts
+# que vencem nas próximas horas e publica cada um no horário, sem depender do próximo cron.
+WAIT_WINDOW = timedelta(hours=5)
 
 fernet = Fernet(os.environ["ESCALADOR_KEY"].encode())
 
@@ -206,51 +209,75 @@ def persist(post_updates, accounts_changed, accounts, remove_files=()):
     raise RuntimeError("Não consegui salvar o status da fila")
 
 
+def sync_remote():
+    """Pega a fila mais nova do repositório (o site pode ter agendado ou cancelado posts)."""
+    git("fetch", "origin")
+    git("reset", "--hard", "origin/main")
+
+
+def scheduled(p):
+    return datetime.fromisoformat(p["scheduled_at"].replace("Z", "+00:00"))
+
+
+def publish_post(post, accounts):
+    acc = accounts.get(post["account"])
+    if not acc:
+        persist({post["id"]: {"status": "error", "error": "Conta não está mais conectada"}}, False, accounts)
+        return
+    upd = {"attempts": post.get("attempts", 0) + 1}
+    try:
+        token = fernet.decrypt(acc["token"].encode()).decode()
+        kind = post.get("type", "reel")
+        caption = f"{post['caption']}\n\n{post.get('hashtags', '')}".strip()
+        if kind == "photo":
+            media_id = publish_photo(token, acc.get("user_id"), post["images"][0], caption)
+        elif kind == "carousel":
+            media_id = publish_carousel(token, acc.get("user_id"), post["images"], caption)
+        else:
+            video = download_video(post["asset"])
+            media_id = publish_reel(token, acc.get("user_id"), video, caption)
+            video.unlink(missing_ok=True)
+        upd.update(media_id=media_id, status="posted", posted_at=now().isoformat(), error=None)
+        print(f"[ok] {post['id']} ({kind}) publicado em @{acc.get('username')}", flush=True)
+    except Exception as e:
+        upd["error"] = str(e)[:500]
+        if upd["attempts"] >= MAX_ATTEMPTS:
+            upd["status"] = "error"
+        print(f"[erro] {post['id']}: {e}", flush=True)
+    # Salva logo depois de cada post: se o job cair, não publica duas vezes
+    done = upd.get("status") == "posted"
+    persist({post["id"]: upd}, False, accounts, (post.get("images") or ()) if done else ())
+    if done and post.get("asset"):
+        subprocess.run(["gh", "release", "delete-asset", "videos", post["asset"], "-y"], cwd=ROOT)
+
+
 def main():
     git("config", "user.name", "Escalador")
     git("config", "user.email", "bot@escalador.local")
-    queue = load(QUEUE, [])
     accounts = load(ACCOUNTS, {})
-    accounts_changed = refresh_tokens(accounts)
-    if accounts_changed:
+    if refresh_tokens(accounts):
         persist({}, True, accounts)
+    deadline = now() + WAIT_WINDOW
 
-    due = [p for p in queue if p["status"] == "pending" and datetime.fromisoformat(
-        p["scheduled_at"].replace("Z", "+00:00")) <= now()]
-    due.sort(key=lambda p: p["scheduled_at"])
-    print(f"{len(due)} post(s) no horário")
-
-    for post in due[:MAX_PER_RUN]:
-        acc = accounts.get(post["account"])
-        if not acc:
-            persist({post["id"]: {"status": "error", "error": "Conta não está mais conectada"}}, False, accounts)
+    while True:
+        queue = load(QUEUE, [])
+        pending = sorted((p for p in queue if p["status"] == "pending"), key=scheduled)
+        due = [p for p in pending if scheduled(p) <= now()]
+        print(f"{len(due)} post(s) no horário", flush=True)
+        for post in due[:MAX_PER_RUN]:
+            publish_post(post, accounts)
+        if due:
+            sync_remote()
+            accounts = {**load(ACCOUNTS, {}), **accounts}
             continue
-        upd = {"attempts": post.get("attempts", 0) + 1}
-        try:
-            token = fernet.decrypt(acc["token"].encode()).decode()
-            kind = post.get("type", "reel")
-            caption = f"{post['caption']}\n\n{post.get('hashtags', '')}".strip()
-            if kind == "photo":
-                media_id = publish_photo(token, acc.get("user_id"), post["images"][0], caption)
-            elif kind == "carousel":
-                media_id = publish_carousel(token, acc.get("user_id"), post["images"], caption)
-            else:
-                video = download_video(post["asset"])
-                media_id = publish_reel(token, acc.get("user_id"), video, caption)
-                video.unlink(missing_ok=True)
-            upd.update(media_id=media_id, status="posted", posted_at=now().isoformat(), error=None)
-            print(f"[ok] {post['id']} ({kind}) publicado em @{acc.get('username')}")
-        except Exception as e:
-            upd["error"] = str(e)[:500]
-            if upd["attempts"] >= MAX_ATTEMPTS:
-                upd["status"] = "error"
-            print(f"[erro] {post['id']}: {e}")
-        # Salva logo depois de cada post: se o job cair, não publica duas vezes
-        done = upd.get("status") == "posted"
-        persist({post["id"]: upd}, False, accounts, (post.get("images") or ()) if done else ())
-        if done and post.get("asset"):
-            subprocess.run(["gh", "release", "delete-asset", "videos", post["asset"], "-y"], cwd=ROOT)
-    return 0
+        upcoming = [p for p in pending if scheduled(p) <= deadline]
+        if not upcoming:
+            return 0
+        wait = (scheduled(upcoming[0]) - now()).total_seconds()
+        print(f"próximo post às {upcoming[0]['scheduled_at']}: esperando {wait / 60:.0f} min", flush=True)
+        time.sleep(max(1, min(wait, 300)))  # acorda a cada 5 min para ver cancelamentos/novos posts
+        sync_remote()
+        accounts = {**load(ACCOUNTS, {}), **accounts}
 
 
 if __name__ == "__main__":
